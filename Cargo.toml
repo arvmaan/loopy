@@ -1,0 +1,29 @@
+[package]
+name = "loopy"
+version = "0.1.0"
+edition = "2024"
+description = "Loopy — a plug-and-play, composable pipeline engine that loops autonomous coding agents through tasks."
+license = "MIT"
+
+[dependencies]
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+notify = "9.0.0-rc.2"
+clap = { version = "4", features = ["derive"] }
+serde_yaml = "0.9"
+toml = "0.8"
+
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs"] }
+
+futures-util = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
