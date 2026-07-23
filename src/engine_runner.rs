@@ -26,6 +26,14 @@ fn pid_is_live(pid: u64) -> bool {
     }
 }
 
+/// True if a watcher events-file `source` belongs to the given block work dir.
+/// A block's events live at `<block_dir>/.ralph/events-*.jsonl`, so the block
+/// identity is in the DIRECTORY, not the (Ralph-chosen) filename — attributing by
+/// filename/loop_id never matched and hung every linear pipeline on block 1.
+fn event_source_matches_block(source: &std::path::Path, block_dir: &std::path::Path) -> bool {
+    source.starts_with(block_dir)
+}
+
 pub struct EngineRunner {
     pub engine: Engine,
     orchestrator: Orchestrator,
@@ -48,6 +56,11 @@ pub struct EngineRunner {
     /// advances; no real `ralph` is launched. Prevents tests from leaking
     /// processes (a fork-bomb hazard). Always false in production.
     no_spawn: bool,
+    /// Wall-clock of the last observed progress (file event OR a spawn). Drives
+    /// the liveness fallback: if the current agent process dies and no progress
+    /// is seen for `HANG_GRACE`, the pipeline is unstuck (completed-if-output, or
+    /// failed) instead of hanging forever. `None` until the first spawn.
+    last_progress: Option<std::time::Instant>,
 }
 
 impl EngineRunner {
@@ -114,7 +127,103 @@ impl EngineRunner {
             task: engine_idea,
             paused_block: None,
             no_spawn: false,
+            last_progress: None,
         })
+    }
+
+    /// Grace period after the last progress + agent-process death before the
+    /// liveness fallback unsticks a stalled pipeline. Generous so it never fires
+    /// during normal between-iteration gaps of a live agent.
+    const HANG_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
+
+    /// Liveness fallback: is the current run wedged? True when (a) we've spawned
+    /// something, (b) no progress for `HANG_GRACE`, and (c) no agent loop is still
+    /// alive. Used by `poll()` so a crashed/exited agent that never emitted a
+    /// completion event can't hang the pipeline forever.
+    fn is_stalled(&mut self) -> bool {
+        let Some(since) = self.last_progress else {
+            return false;
+        };
+        if since.elapsed() < Self::HANG_GRACE {
+            return false;
+        }
+        // Any loop this runner spawned still running? (ralph is one long-lived
+        // process per loop, so a live child means work is genuinely in progress.)
+        let ids: Vec<String> = self.orchestrator.active_loops().keys().cloned().collect();
+        !ids.iter().any(|id| self.orchestrator.is_alive(id))
+    }
+
+    /// Unstick a stalled run (its agent died without emitting completion). If the
+    /// current stage/block produced its expected output we accept it as complete
+    /// and advance; otherwise we fail the stage/run so it terminates instead of
+    /// hanging. Returns true if state changed. Resets the hang timer either way so
+    /// we don't re-fire every tick.
+    async fn handle_stall(&mut self) -> bool {
+        self.last_progress = Some(std::time::Instant::now());
+
+        if self.is_linear() {
+            let Some(current_id) = self.linear_run.as_ref().and_then(|r| r.current.clone()) else {
+                return false;
+            };
+            if self.block_has_output(&current_id) {
+                self.log("warn", &format!(
+                    "Block '{current_id}' agent exited without a completion event but produced output — advancing"
+                )).await;
+                self.drive_linear().await;
+            } else {
+                self.log("error", &format!(
+                    "Block '{current_id}' agent exited without completing and produced no output — stopping pipeline"
+                )).await;
+                orchestrator::kill_all_project_ralph(&self.project_root);
+                if let Some(run) = self.linear_run.as_mut() {
+                    run.done = true;
+                    run.current = None;
+                }
+                self.paused_block = None;
+                self.save_linear_run();
+            }
+            return true;
+        }
+
+        // POC path: map the running phase to its stage.
+        let stage = match self.engine.state.phase {
+            Phase::Scanning => StageId::Scan,
+            Phase::Planning => StageId::Plan,
+            Phase::Landing => StageId::Land,
+            Phase::TestFlying => StageId::TestFlight,
+            // Not in a single-agent running phase (e.g. RunningTracks is handled by
+            // reconcile_tracks; review phases wait on the user) — nothing to unstick.
+            _ => return false,
+        };
+        if self.stage_has_output(stage) {
+            self.log("warn", &format!(
+                "{stage:?} agent exited without a completion event but produced output — accepting"
+            )).await;
+            let stage_dir = self.stages_dir.join(orchestrator::stage_dir_name(stage));
+            let _ = orchestrator::collect_stage_output(&stage_dir);
+            if stage == StageId::Plan {
+                self.load_tracks_from_plan(&stage_dir);
+            }
+            let event = match stage {
+                StageId::Scan => EngineEvent::ScanComplete,
+                StageId::Plan => EngineEvent::PlanComplete,
+                StageId::Land => EngineEvent::LandComplete,
+                StageId::TestFlight => EngineEvent::TestFlightComplete,
+                _ => return false,
+            };
+            let effects = self.engine.transition(event);
+            self.process_effects(effects).await;
+        } else {
+            self.log("error", &format!(
+                "{stage:?} agent exited without completing and produced no output — failing stage"
+            )).await;
+            let effects = self.engine.transition(EngineEvent::StageFailed {
+                stage,
+                error: "agent process exited without completing".into(),
+            });
+            self.process_effects(effects).await;
+        }
+        true
     }
 
     /// Test-only: disable real process spawning so driver-logic tests never
@@ -388,7 +497,8 @@ impl EngineRunner {
                     .unwrap_or_default();
                 for track_id in track_ids {
                     self.log("info", &format!("Resuming track {} (re-spawning)", track_id)).await;
-                    self.spawn_track(&track_id, None).await;
+                    let more = self.spawn_track(&track_id, None).await;
+                    self.process_effects(more).await;
                 }
             }
             _ => {}
@@ -433,11 +543,18 @@ impl EngineRunner {
             }
         }
 
-        // Dead process check disabled — Ralph legitimately exits between iterations.
-        // Completion is detected via file watcher events (scan.complete in JSONL).
-        // TODO: re-enable with grace period once multi-iteration Ralph behavior is handled.
-
-        if file_events.is_empty() {
+        if !file_events.is_empty() {
+            // Any activity counts as progress and resets the hang timer.
+            self.last_progress = Some(std::time::Instant::now());
+        } else {
+            // No events this tick. Completion is normally detected via watcher
+            // events, but a crashed/OOM-killed/exited agent may never emit one —
+            // which previously hung the pipeline forever. Liveness fallback: if the
+            // agent process is dead and we've seen no progress for the grace
+            // period, unstick the run (accept output-based completion, else fail).
+            if self.is_stalled() {
+                return self.handle_stall().await;
+            }
             return false;
         }
 
@@ -446,19 +563,22 @@ impl EngineRunner {
         // is_linear() is true.
         if self.is_linear() {
             // Drive blocks, but ONLY advance when the CURRENTLY-running block's own
-            // ralph emits completion. Every block dir is watched, so we must
-            // attribute events to the current block by its events file's loop_id —
-            // otherwise a stale/late completion from an earlier block (e.g. scan)
-            // would wrongly advance the active block (the "Build fell through" bug).
+            // ralph emits completion. Every block dir is watched, so we attribute
+            // each event to a block by the DIRECTORY its events file lives in
+            // (`<stages_dir>/<block_id>/.ralph/events-*.jsonl`) — NOT by loop_id,
+            // which Ralph derives from its own internal id and never matches the
+            // block id (that mismatch previously left every linear pipeline hung on
+            // block 1 forever). A stale/late completion from an earlier block is
+            // ignored because its source dir is a different block_id.
             let Some(current_id) = self.linear_run.as_ref().and_then(|r| r.current.clone()) else {
                 return false;
             };
+            let block_dir = self.stages_dir.join(&current_id);
             let mut completed = false;
             for file_event in file_events {
-                // Which block's events file is this? loop_id is "<block_id>-<ts>".
                 let from_current = match &file_event {
-                    crate::watcher::FileEvent::EventsAppended { loop_id, .. } => {
-                        loop_id == &current_id || loop_id.starts_with(&format!("{current_id}-"))
+                    crate::watcher::FileEvent::EventsAppended { source, .. } => {
+                        event_source_matches_block(source, &block_dir)
                     }
                     _ => false,
                 };
@@ -473,6 +593,12 @@ impl EngineRunner {
             // Require the current block's output to actually exist before advancing
             // (guards against a spurious terminate before the block did its work).
             if completed && self.block_has_output(&current_id) {
+                // Kill the completed block's Ralph loop before advancing so it
+                // can't linger and keep emitting (the POC path already does this).
+                let killed = self.orchestrator.kill_loops_for_block(&current_id).await;
+                if killed > 0 {
+                    self.log("info", &format!("Stopped {killed} Ralph loop(s) for block '{current_id}'")).await;
+                }
                 self.drive_linear().await;
                 return true;
             }
@@ -621,10 +747,12 @@ impl EngineRunner {
                         pending.extend(inner);
                     }
                     Effect::SpawnTrack { track_id } => {
-                        self.spawn_track(&track_id, None).await;
+                        let more = self.spawn_track(&track_id, None).await;
+                        pending.extend(more);
                     }
                     Effect::SpawnTrackWithFeedback { track_id, feedback } => {
-                        self.spawn_track(&track_id, Some(&feedback)).await;
+                        let more = self.spawn_track(&track_id, Some(&feedback)).await;
+                        pending.extend(more);
                     }
                     Effect::SpawnLand => {
                         self.spawn_stage(StageId::Land, None).await;
@@ -677,6 +805,7 @@ impl EngineRunner {
     }
 
     async fn spawn_stage(&mut self, stage: StageId, extra_context: Option<&str>) {
+        self.last_progress = Some(std::time::Instant::now());
         let config = LoopyConfig::load_or_default(&self.project_root);
         let idea = &self.engine.state.idea;
         let kb_path = self.project_root.join(".loopy/knowledge-base.md");
@@ -785,7 +914,12 @@ impl EngineRunner {
         }
     }
 
-    async fn spawn_track(&mut self, track_id: &str, feedback: Option<&str>) {
+    /// Spawn a track's Ralph loop. On spawn/setup failure, returns the engine
+    /// effects from marking the track Failed (so the caller's effect loop can drain
+    /// them, e.g. advancing to code review) — returning them instead of calling
+    /// process_effects recursively avoids an async recursion cycle.
+    async fn spawn_track(&mut self, track_id: &str, feedback: Option<&str>) -> Vec<Effect> {
+        self.last_progress = Some(std::time::Instant::now());
         let config = LoopyConfig::load_or_default(&self.project_root);
         let track_defs = crate::config::load_track_definitions(&self.project_root, &config);
         let (description, dep_tracks) = track_defs
@@ -839,14 +973,26 @@ impl EngineRunner {
                         self.log("info", &format!("Spawned Ralph for track {}", track_id)).await;
                     }
                     Err(e) => {
+                        // Must mark the track Failed — otherwise it stays Running,
+                        // all_tracks_terminal() is never true, and the pipeline is
+                        // stuck in RunningTracks forever.
                         self.log("error", &format!("Failed to spawn track {}: {}", track_id, e)).await;
+                        return self.engine.transition(EngineEvent::TrackFailed {
+                            track_id: track_id.to_string(),
+                            error: format!("{e}"),
+                        });
                     }
                 }
             }
             Err(e) => {
                 self.log("error", &format!("Track dir setup failed for {}: {}", track_id, e)).await;
+                return self.engine.transition(EngineEvent::TrackFailed {
+                    track_id: track_id.to_string(),
+                    error: format!("{e}"),
+                });
             }
         }
+        Vec::new()
     }
 
     /// Draft a bare-bones TESTING-PLAN.md for the Test Flight stage. Deterministic
@@ -959,6 +1105,7 @@ impl EngineRunner {
         prior_stage_ids: &[String],
         feedback: Option<&str>,
     ) -> Option<std::path::PathBuf> {
+        self.last_progress = Some(std::time::Instant::now());
         let config = LoopyConfig::load_or_default(&self.project_root);
         // Work dir: .loopy/stages/<block_id>/ (parallel to POC stage dirs).
         let work_dir = self.stages_dir.join(&block.id);
@@ -1061,14 +1208,17 @@ impl EngineRunner {
     fn stage_has_output(&self, stage: StageId) -> bool {
         let dir = self.stages_dir.join(orchestrator::stage_dir_name(stage));
         let exists = |rels: &[&str]| rels.iter().any(|r| dir.join(r).exists());
+        // NOTE: the agent scratchpad (output/scratchpad.md, .ralph/agent/scratchpad.md)
+        // is created for EVERY run before any real work, so it must NOT count as
+        // output — accepting it let a Plan that never wrote tracks.json report
+        // "complete", so tracks never launched. Require a real artifact instead.
         match stage {
             StageId::Scan => exists(&[
                 "scan-report.md", "report.md", "output/scan-report.md",
-                "environment.json", "output/scratchpad.md", ".ralph/agent/scratchpad.md",
+                "environment.json", "output/environment.json",
             ]),
             StageId::Plan => exists(&[
                 "tracks.json", "output/tracks.json", "PLAN.md", "output/PLAN.md",
-                "output/scratchpad.md", ".ralph/agent/scratchpad.md",
             ]),
             // Land has no strict required artifact; accept its completion.
             _ => true,
@@ -1236,6 +1386,25 @@ impl EngineRunner {
         pid_is_live(pid)
     }
 
+    /// True only when we can CONFIRM a track's Ralph is dead: its `loop.lock`
+    /// exists (so the loop actually started and recorded a PID) but that PID is no
+    /// longer live. Distinct from `!track_loop_alive` (which is also true in the
+    /// spawn window before the lock is written) — used by reconcile so a
+    /// just-spawned track isn't prematurely failed.
+    fn track_loop_confirmed_dead(&self, track_id: &str) -> bool {
+        let lock = self.track_work_dir(track_id).join(".ralph/loop.lock");
+        let Ok(content) = std::fs::read_to_string(&lock) else {
+            return false; // no lock yet → could be starting; not confirmed dead
+        };
+        let Some(pid) = serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|j| j.get("pid").and_then(|p| p.as_u64()))
+        else {
+            return false;
+        };
+        !pid_is_live(pid)
+    }
+
     /// Resolve the on-disk work directory for a track (workspace dir if present,
     /// otherwise the stage track dir).
     pub fn track_work_dir(&self, track_id: &str) -> PathBuf {
@@ -1300,7 +1469,19 @@ impl EngineRunner {
                         error: "Ralph loop stopped without landing (max iterations or error)".into(),
                     });
                 }
-                Disposition::Active => {}
+                Disposition::Active => {
+                    // "Active" only means the inspector saw no terminal marker. If
+                    // the track's Ralph process is actually dead (crashed / killed
+                    // without writing a landed/max-iterations marker), it would
+                    // otherwise stay Running forever and wedge RunningTracks. Treat
+                    // a dead loop with no terminal marker as Failed.
+                    if self.track_loop_confirmed_dead(&track.id) {
+                        events.push(EngineEvent::TrackFailed {
+                            track_id: track.id.clone(),
+                            error: "Ralph process is no longer running and produced no completion marker".into(),
+                        });
+                    }
+                }
             }
         }
 
@@ -1429,6 +1610,33 @@ mod tests {
         // submit_cr completes → done.
         r.drive_linear().await;
         assert!(r.linear_snapshot().unwrap().5); // done == true
+    }
+
+    #[test]
+    fn event_attributed_by_directory_not_ralph_filename() {
+        // Regression for the #1 bug: linear pipelines hung forever because
+        // completion was attributed by loop_id (Ralph's own filename id), which
+        // never equals the block id. Attribution must be by the events file's
+        // DIRECTORY (<stages_dir>/<block_id>/.ralph/events-*.jsonl).
+        let stages = std::path::Path::new("/proj/.loopy/stages");
+        let block_dir = stages.join("implement");
+
+        // Ralph names its events file after its OWN internal id — a bare
+        // timestamp that shares nothing with the block id. This MUST still match
+        // because it lives under the block's dir.
+        let ralph_named = block_dir.join(".ralph/events-primary-20260616-2254.jsonl");
+        assert!(
+            event_source_matches_block(&ralph_named, &block_dir),
+            "event under the block dir must be attributed to it regardless of filename"
+        );
+
+        // A completion from a DIFFERENT block (e.g. an earlier scan) must NOT be
+        // attributed to the current block — that was the "fell through" bug.
+        let other = stages.join("scan/.ralph/events-primary-20260616-2250.jsonl");
+        assert!(
+            !event_source_matches_block(&other, &block_dir),
+            "event from another block's dir must be ignored"
+        );
     }
 
     #[tokio::test]

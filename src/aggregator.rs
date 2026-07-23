@@ -90,6 +90,7 @@ impl Aggregator {
             FileEvent::EventsAppended {
                 loop_id,
                 new_events,
+                ..
             } => {
                 // The loop_id encodes which stage emitted the event
                 // (e.g. "Scan-123", "Plan-456", "OrbitalLanes-789"), so a
@@ -272,6 +273,7 @@ mod tests {
     fn make_events_appended(topic: &str) -> FileEvent {
         FileEvent::EventsAppended {
             loop_id: "loop-1".into(),
+            source: PathBuf::from("loop-1/.ralph/events-loop-1.jsonl"),
             new_events: vec![make_event(topic)],
         }
     }
@@ -392,6 +394,7 @@ mod tests {
 
         agg.apply(FileEvent::EventsAppended {
             loop_id: "loop-1".into(),
+            source: PathBuf::from("loop-1/.ralph/events-loop-1.jsonl"),
             new_events: vec![RalphEvent {
                 timestamp: ts1,
                 topic: "scan.complete".into(),
@@ -404,6 +407,7 @@ mod tests {
 
         agg.apply(FileEvent::EventsAppended {
             loop_id: "loop-1".into(),
+            source: PathBuf::from("loop-1/.ralph/events-loop-1.jsonl"),
             new_events: vec![RalphEvent {
                 timestamp: ts2,
                 topic: "some.event".into(),
@@ -470,6 +474,7 @@ mod tests {
     fn make_events_appended_with_payload(topic: &str, payload: serde_json::Value) -> FileEvent {
         FileEvent::EventsAppended {
             loop_id: "loop-1".into(),
+            source: PathBuf::from("loop-1/.ralph/events-loop-1.jsonl"),
             new_events: vec![RalphEvent {
                 timestamp: DateTime::parse_from_rfc3339("2026-03-31T20:00:00+00:00").unwrap(),
                 topic: topic.to_string(),
@@ -609,6 +614,7 @@ mod tests {
         let mut agg = Aggregator::new();
         agg.apply(FileEvent::EventsAppended {
             loop_id: "loop-1".into(),
+            source: PathBuf::from("loop-1/.ralph/events-loop-1.jsonl"),
             new_events: vec![RalphEvent {
                 timestamp: DateTime::parse_from_rfc3339("2026-03-31T20:00:00+00:00").unwrap(),
                 topic: "design.start".into(),
@@ -631,6 +637,7 @@ mod tests {
         let ts2 = DateTime::parse_from_rfc3339("2026-03-31T21:00:00+00:00").unwrap();
         agg.apply(FileEvent::EventsAppended {
             loop_id: "loop-old".into(),
+            source: PathBuf::from("loop-old/.ralph/events-loop-old.jsonl"),
             new_events: vec![RalphEvent {
                 timestamp: ts1,
                 topic: "old.topic".into(),
@@ -642,6 +649,7 @@ mod tests {
         });
         agg.apply(FileEvent::EventsAppended {
             loop_id: "loop-new".into(),
+            source: PathBuf::from("loop-new/.ralph/events-loop-new.jsonl"),
             new_events: vec![RalphEvent {
                 timestamp: ts2,
                 topic: "new.topic".into(),
@@ -789,6 +797,7 @@ mod tests {
         // Populate some loop state
         agg.apply(FileEvent::EventsAppended {
             loop_id: "loop-1".into(),
+            source: PathBuf::from("loop-1/.ralph/events-loop-1.jsonl"),
             new_events: vec![RalphEvent {
                 timestamp: DateTime::parse_from_rfc3339("2026-03-31T20:00:00+00:00").unwrap(),
                 topic: "scan.complete".into(),
@@ -838,6 +847,7 @@ mod tests {
         let mut agg = Aggregator::new();
         let result = agg.apply(FileEvent::EventsAppended {
             loop_id: "loop-1".into(),
+            source: PathBuf::from("loop-1/.ralph/events-loop-1.jsonl"),
             new_events: vec![RalphEvent {
                 timestamp: DateTime::parse_from_rfc3339("2026-04-01T10:30:00+00:00").unwrap(),
                 topic: "build.done".into(),

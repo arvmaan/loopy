@@ -1824,6 +1824,23 @@ impl Orchestrator {
         count
     }
 
+    /// Kill all loops for a linear-pipeline block. The block's loop_id is
+    /// `<block_id>-<ts>`, so match by that prefix. Returns count killed.
+    pub async fn kill_loops_for_block(&mut self, block_id: &str) -> usize {
+        let prefix = format!("{block_id}-");
+        let ids: Vec<String> = self
+            .loops
+            .keys()
+            .filter(|id| id.as_str() == block_id || id.starts_with(&prefix))
+            .cloned()
+            .collect();
+        let count = ids.len();
+        for id in ids {
+            let _ = self.kill(&id).await;
+        }
+        count
+    }
+
     /// Kill all loops running for a given track. Returns count killed.
     pub async fn kill_loops_for_track(&mut self, track_id: &str) -> usize {
         let ids: Vec<String> = self
@@ -1910,6 +1927,13 @@ pub fn kill_all_project_ralph(project_root: &Path) -> usize {
         if pid == 0 {
             continue;
         }
+        // PID-reuse guard: the lock is on disk and may be stale, so the OS could
+        // have recycled this PID for an unrelated process. Only kill if the PID is
+        // still a `ralph` process — otherwise we'd SIGKILL someone else's process
+        // group. Best-effort via /proc; if we can't read it, the process is gone.
+        if !pid_is_ralph(pid) {
+            continue;
+        }
         let ok = std::process::Command::new("kill")
             .args(["-KILL", &format!("-{pid}")])
             .stdout(Stdio::null())
@@ -1922,6 +1946,23 @@ pub fn kill_all_project_ralph(project_root: &Path) -> usize {
         }
     }
     killed
+}
+
+/// True if `pid` names a live process whose command is `ralph` (checked via
+/// `/proc/<pid>/cmdline`). Used to avoid SIGKILLing a reused PID that no longer
+/// belongs to a Loopy-spawned Ralph loop.
+fn pid_is_ralph(pid: u32) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false; // no /proc entry → process is gone
+    };
+    // cmdline is NUL-separated argv; the executable is the first field.
+    let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or(&[]);
+    let argv0 = String::from_utf8_lossy(argv0);
+    std::path::Path::new(argv0.as_ref())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n == "ralph" || n.starts_with("ralph"))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1960,10 +2001,25 @@ mod tests {
         // Spawn a real long-running child as its OWN process group leader — exactly
         // how ralph is spawned (process_group(0)). This proves abort genuinely
         // reaps live processes, not just removes lock files.
-        let mut cmd = std::process::Command::new("sleep");
+        //
+        // The sweep now guards against PID reuse by only killing PIDs whose
+        // /proc cmdline is a `ralph` process, so the stand-in must be NAMED ralph:
+        // symlink `sleep` to a `ralph`-named binary in a tempdir and exec that.
+        let bindir = tempfile::TempDir::new().unwrap();
+        let ralph_bin = bindir.path().join("ralph");
+        let sleep_path = std::process::Command::new("sh")
+            .args(["-c", "command -v sleep"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sleep".to_string());
+        std::os::unix::fs::symlink(&sleep_path, &ralph_bin).expect("symlink ralph->sleep");
+
+        let mut cmd = std::process::Command::new(&ralph_bin);
         cmd.arg("120");
         cmd.process_group(0); // child leads its own group; pid == pgid
-        let child = cmd.spawn().expect("spawn sleep");
+        let child = cmd.spawn().expect("spawn ralph (sleep)");
         let pid = child.id();
 
         // Confirm it's alive.

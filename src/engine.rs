@@ -544,7 +544,19 @@ impl Engine {
     }
 
     fn enter_code_review(&mut self) -> Vec<Effect> {
-        self.set_stage_status(StageId::OrbitalLanes, StageStatus::Complete);
+        // Reflect reality: if any track failed, the stage is not a clean success.
+        // Marking it Complete regardless surfaced a failed build as a green stage.
+        let any_failed = self
+            .state
+            .tracks
+            .as_ref()
+            .is_some_and(|ts| ts.iter().any(|t| t.status == TrackStatus::Failed));
+        let stage_status = if any_failed {
+            StageStatus::Failed
+        } else {
+            StageStatus::Complete
+        };
+        self.set_stage_status(StageId::OrbitalLanes, stage_status);
         self.state.phase = Phase::AwaitingCodeReview;
         self.state.code_iteration += 1;
         vec![

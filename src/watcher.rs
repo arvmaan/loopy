@@ -9,6 +9,11 @@ use tokio::sync::mpsc;
 pub enum FileEvent {
     EventsAppended {
         loop_id: String,
+        /// Full path to the events file that changed. The block/stage identity is
+        /// encoded in the DIRECTORY (`stages_dir/<block_id>/.ralph/events-*.jsonl`),
+        /// not the filename (Ralph names the file after its own internal id), so
+        /// consumers attribute completion by this path — never by `loop_id`.
+        source: PathBuf,
         new_events: Vec<RalphEvent>,
     },
     TasksChanged {
@@ -194,14 +199,26 @@ pub async fn start(
                             let mut map = offsets_clone.lock().unwrap();
                             let offset = map.get(path).copied().unwrap_or(0);
                             if let Ok((events, new_offset)) = read_new_events(path, offset) {
-                                map.insert(path.clone(), new_offset);
                                 if !events.is_empty()
                                     && let Some(loop_id) = extract_loop_id(path)
                                 {
-                                    let _ = tx_clone.try_send(FileEvent::EventsAppended {
+                                    // Only advance the persisted offset once the event
+                                    // is actually queued — if the channel is full,
+                                    // leave the offset so these events are re-read on
+                                    // the next notification instead of being lost
+                                    // (finding: dropped completion event hangs the loop).
+                                    match tx_clone.try_send(FileEvent::EventsAppended {
                                         loop_id,
+                                        source: path.clone(),
                                         new_events: events,
-                                    });
+                                    }) {
+                                        Ok(()) => {
+                                            map.insert(path.clone(), new_offset);
+                                        }
+                                        Err(_) => { /* keep old offset; retry next notify */ }
+                                    }
+                                } else {
+                                    map.insert(path.clone(), new_offset);
                                 }
                             }
                         } else if matches!(event.kind, EventKind::Create(_)) {
@@ -363,6 +380,7 @@ mod tests {
             FileEvent::EventsAppended {
                 loop_id,
                 new_events,
+                source: _,
             } => {
                 assert_eq!(loop_id, "loop1");
                 assert_eq!(new_events.len(), 1);
@@ -449,6 +467,7 @@ mod tests {
             FileEvent::EventsAppended {
                 loop_id,
                 new_events,
+                source: _,
             } => {
                 assert_eq!(loop_id, "newloop");
                 assert_eq!(new_events.len(), 1);
@@ -501,6 +520,7 @@ mod tests {
                 Ok(Some(FileEvent::EventsAppended {
                     loop_id,
                     new_events,
+                    source: _,
                 })) => {
                     assert_eq!(loop_id, "test123");
                     assert_eq!(new_events.len(), 1);

@@ -839,17 +839,13 @@ pub fn alive_stage_pids(
         .collect()
 }
 
-/// Kill any stale `ralph run` processes from previous Loopy runs. Sends SIGKILL
-/// so nothing survives as an orphan — the hanging-instance problem. The primary,
-/// reliable cleanup is the process-group kill in `orchestrator::kill_all_project_ralph`
-/// (which reaps the agent-CLI grandchildren via loop.lock PIDs); this is the
-/// name-based fallback for anything not tracked in a loop.lock. Errors ignored
-/// (nothing to kill is fine).
-pub fn kill_stale_ralph() {
-    std::process::Command::new("pkill")
-        .args(["-9", "-f", "ralph run"])
-        .output()
-        .ok();
+/// Kill stale Ralph loops belonging to THIS project (from a previous run) so a
+/// restart doesn't stack fresh loops on orphans. Scoped to the project via the
+/// `loop.lock` PID sweep in `orchestrator::kill_all_project_ralph` — it never
+/// touches other projects' or other users' `ralph` processes on a shared host.
+/// Returns the number of process groups signalled. Best-effort.
+pub fn kill_stale_ralph(project_root: &std::path::Path) -> usize {
+    crate::orchestrator::kill_all_project_ralph(project_root)
 }
 
 #[cfg(test)]
@@ -950,10 +946,12 @@ mod tests {
         assert!(state.active_conflicts.is_empty());
     }
 
-    // kill_stale_ralph returns without error (pkill may or may not find processes)
+    // kill_stale_ralph returns without error on a project dir with no live loops
     #[test]
     fn kill_stale_ralph_does_not_panic() {
-        kill_stale_ralph(); // must not panic regardless of whether ralph is running
+        let dir = tempfile::TempDir::new().unwrap();
+        let n = kill_stale_ralph(dir.path()); // must not panic; nothing to kill
+        assert_eq!(n, 0);
     }
 
     // AC-Clean1: Parse `loopy clean`

@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
         } => {
             // Kill any stale agent loops from a previous run BEFORE starting/resuming,
             // so restarting doesn't spawn fresh loops on top of orphaned ones.
-            kill_stale_ralph();
+            kill_stale_ralph(&std::env::current_dir().unwrap_or_default());
 
             let loopy_config = loopy::config::LoopyConfig::load_or_default(
                 &std::env::current_dir().unwrap_or_default(),
@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Clean { keep_state, stage } => {
-            kill_stale_ralph();
+            kill_stale_ralph(&std::env::current_dir().unwrap_or_default());
             if let Some(stage_name) = stage {
                 let checkpoint = project_path(None);
                 let mut state = load_or_fresh(&checkpoint);
@@ -410,12 +410,10 @@ async fn run_server(
             if n > 0 {
                 println!("Stopped {n} agent process group(s).");
             }
-            kill_stale_ralph();
         })
         .await?;
     // Belt-and-suspenders: also kill on normal exit.
     let _ = loopy::orchestrator::kill_all_project_ralph(&project_root);
-    kill_stale_ralph();
     Ok(())
 }
 
